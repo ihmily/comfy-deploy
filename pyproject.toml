@@ -1,0 +1,15 @@
+[project]
+name = "comfy-deploy"
+description = "Easy deploy API for ComfyUI."
+version = "1.0.0"
+license = { file = "LICENSE" }
+dependencies = ["numpy", "pillow", "torch", "opencv-python", "httpx>=0.28.1", "pycryptodome"]
+
+[project.urls]
+Repository = "https://github.com/ihmily/comfy-deploy"
+#  Used by Comfy Registry https://comfyregistry.org
+
+[tool.comfy]
+PublisherId = "hmily"
+DisplayName = "comfy-deploy"
+Icon = ""
