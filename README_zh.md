@@ -40,6 +40,12 @@ ComfyDeploy 项目系统，由以下两部分组成：
 - comfy-deploy 节点扩展提供了创建可部署工作流所需的节点和部署功能,将图片、文本等暴露成为外部输入。
 - comfy-deploy-admin 提供了管理界面，用于管理已部署的工作流、调试API接口、监控任务执行等
 
+## 版本说明
+
+- comfy-deploy v1.0.0：只支持 ComfyUI v0.3.48~0.3.66
+- comfy-deploy v1.0.1：只支持 ComfyUI v0.3.67 及以上
+
+
 ## 使用方法
 
 ### 1. 安装 comfy-deploy-admin

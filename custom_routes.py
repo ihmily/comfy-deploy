@@ -686,6 +686,8 @@ async def execute_prompt(prompt: dict, client_id: str = None, pre_prompt_id: str
         "client_id": client_id,
         "prompt_id": prompt_id
     }
+    # ComfyUI v0.3.67 and above add sensitive data field
+    sensitive_data = {}
     #logger.info(f"[comfy-deploy] Set client_id for task {prompt_id}: {client_id}")
 
     # Get output nodes
@@ -696,7 +698,7 @@ async def execute_prompt(prompt: dict, client_id: str = None, pre_prompt_id: str
     prompt_server.number += 1
 
     prompt_server.prompt_queue.put(
-        (number, prompt_id, prompt, extra_data, outputs_to_execute)
+        (number, prompt_id, prompt, extra_data, outputs_to_execute, sensitive_data)
     )
 
     # Mark task as API created task
