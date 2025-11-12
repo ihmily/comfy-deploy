@@ -314,6 +314,14 @@ def _update_workflow_progress(event_name: str, prompt_id: str, client_id: str, d
             }
 
         task_manager.execution_outputs[prompt_id] = {'outputs': {}}
+        ws_manager.ws_event_queue.put((prompt_id, "callback", ("task_started", {
+            "prompt_id": prompt_id,
+            "client_id": client_id,
+            "status": "running",
+            "progress": 0,
+            "message": "Task started executing",
+            "timestamp": int(time.time())
+        })))
 
     elif event_name == "executing":
         # Node started executing
