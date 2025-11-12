@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from io import BytesIO
 import base64
-from comfyapi_utils import is_valid_url
+from comfydeploy_utils import is_valid_url
 
 
 class ComfyDeployExternalImage:
