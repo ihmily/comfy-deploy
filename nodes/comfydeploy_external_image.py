@@ -81,7 +81,7 @@ class ComfyDeployExternalImage:
             return_image = Image.open(BytesIO(decoded_image))
 
         else:
-            print('comfy-deploy: Input image: {param_name} is empty, use default image')
+            print(f'comfy-deploy: Input image: {param_name} is empty, use default image')
             return [default_value]
 
         if not return_image:
