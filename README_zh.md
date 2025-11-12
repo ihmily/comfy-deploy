@@ -43,7 +43,7 @@ ComfyDeploy 项目系统，由以下两部分组成：
 ## 版本说明
 
 - comfy-deploy v1.0.0：只支持 ComfyUI v0.3.48~0.3.66
-- comfy-deploy v1.0.1：只支持 ComfyUI v0.3.67 及以上
+- comfy-deploy v1.0.1~：只支持 ComfyUI v0.3.67 及以上
 
 
 ## 使用方法
