@@ -34,15 +34,13 @@ class ComfyDeployExternalFloat:
 
     def load_float(self, param_name, default_value=0.0, display_name=None, description=None):
         try:
-            if isinstance(param_name, str) and param_name.strip():
-                return_value = float(param_name)
-            else:
-                print('comfy-deploy: Input float is empty or invalid, use default value')
+            if isinstance(default_value, float):
                 return_value = default_value
+            else:
+                return_value = float(default_value)
         except ValueError:
-            print('comfy-deploy: Invalid float value, use default value')
-            return_value = default_value
-        
+            return_value = 0.0
+            print(f'comfy-deploy: Invalid float value, use default value {return_value}.')
         return [return_value]
 
 

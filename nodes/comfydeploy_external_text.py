@@ -33,7 +33,7 @@ class ComfyDeployExternalText:
     CATEGORY = "comfy-deploy/Text"
 
     def load_text(self, param_name, default_value="", display_name=None, description=None):
-        return [default_value]
+        return [str(default_value)]
 
 
 NODE_CLASS_MAPPINGS = {"ComfyDeployExternalText": ComfyDeployExternalText}

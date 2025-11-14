@@ -34,15 +34,13 @@ class ComfyDeployExternalInt:
 
     def load_int(self, param_name, default_value=0, display_name=None, description=None):
         try:
-            if isinstance(param_name, str) and param_name.strip():
-                return_value = int(float(param_name))
-            else:
-                print('comfy-deploy: Input integer is empty or invalid, use default value')
+            if isinstance(default_value, int):
                 return_value = default_value
+            else:
+                return_value = int(float(default_value))
         except ValueError:
-            print('comfy-deploy: Invalid integer value, use default value')
-            return_value = default_value
-        
+            return_value = 0
+            print(f'comfy-deploy: Invalid integer value, use default value {return_value}.')
         return [return_value]
 
 
