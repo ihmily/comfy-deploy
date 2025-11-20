@@ -184,6 +184,10 @@ const i18n = {
         en: 'Workflow "{0}" deployed successfully!<br>Workflow ID: {1}<br>Version: {2}',
         zh: '工作流 "{0}" 部署成功！<br>工作流ID: {1}<br>版本: {2}'
     },
+    updateSuccess: {
+        en: 'Workflow "{0}" updated successfully!<br>Workflow ID: {1}<br>Version: {2}',
+        zh: '工作流 "{0}" 更新成功！<br>工作流ID: {1}<br>版本: {2}'
+    },
     deployFailed: {
         en: 'Failed to deploy workflow: {0}',
         zh: '部署工作流失败: {0}'
@@ -678,18 +682,25 @@ async function deployWorkflow() {
         const prompt = await app.graphToPrompt();
         
         const requestData = {
-            workflow_name: workflowName,
             // workflow: prompt.workflow, // Workflow graph data
             prompt_template: JSON.stringify(prompt.output),
             workflow_graph: JSON.stringify(prompt.workflow),
         };
         
+        let url, method;
         if (workflowId) {
-            requestData.workflow_id = workflowId;
+            // update workflow
+            url = `${deployConfig.endpoint}/workflows/${workflowId}`;
+            method = 'PUT';
+        } else {
+            // new workflow
+            url = `${deployConfig.endpoint}/workflows`;
+            method = 'POST';
+            requestData.workflow_name = workflowName;
         }
         
-        const response = await fetch(`${deployConfig.endpoint}/workflows`, {
-            method: 'POST',
+        const response = await fetch(url, {
+            method: method,
             headers: {
                 'Content-Type': 'application/json',
                 'Authorization': `Bearer ${deployConfig.apiKey}`
@@ -704,11 +715,15 @@ async function deployWorkflow() {
         
         const data = await response.json();
         
-        updateOrCreateDeployNode(workflowName, data.id, data.latest_version || "v1");
+        const responseWorkflowName = data.workflow_name || workflowName;
+        
+        updateOrCreateDeployNode(responseWorkflowName, data.id, data.latest_version || "v1");
         
         loadingDialog.close();
         loadingDialog.remove();
-        const formattedMessage = getText('deploySuccess', workflowName, data.id, data.latest_version || "v1")
+        
+        const messageKey = workflowId ? 'updateSuccess' : 'deploySuccess';
+        const formattedMessage = getText(messageKey, responseWorkflowName, data.id, data.latest_version || "v1")
             .replace('<br>', '<br><br>')
             .replace('Workflow ID:', '<b>Workflow ID:</b>')
             .replace('工作流ID:', '<b>工作流ID:</b>')
