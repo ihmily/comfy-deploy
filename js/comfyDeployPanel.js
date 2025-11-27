@@ -699,14 +699,29 @@ async function deployWorkflow() {
             requestData.workflow_name = workflowName;
         }
         
-        const response = await fetch(url, {
-            method: method,
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${deployConfig.apiKey}`
-            },
-            body: JSON.stringify(requestData)
-        });
+        // Create timeout controller (10 seconds)
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 10000);
+        
+        let response;
+        try {
+            response = await fetch(url, {
+                method: method,
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${deployConfig.apiKey}`
+                },
+                body: JSON.stringify(requestData),
+                signal: controller.signal
+            });
+            clearTimeout(timeoutId);
+        } catch (error) {
+            clearTimeout(timeoutId);
+            if (error.name === 'AbortError') {
+                throw new Error(getText('deployFailed', 'Request timed out (10 seconds)'));
+            }
+            throw error;
+        }
         
         if (!response.ok) {
             const errorData = await response.json();
