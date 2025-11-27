@@ -53,6 +53,9 @@ class TaskManager:
         
         # Store task outputs
         self.execution_outputs = {}  # prompt_id -> {outputs: {}}
+        
+        # Track queued event sent status to prevent duplicate sends
+        self.queued_event_sent = set()  # store prompt_ids that have already sent task_queued event
 
     def is_api_task(self, prompt_id: str) -> bool:
         if prompt_id in self.api_created_tasks:
@@ -79,6 +82,10 @@ class TaskManager:
             self.api_created_tasks.remove(prompt_id)
         
         self.execution_outputs.pop(prompt_id, None)
+        
+        # Clean up queued event sent status
+        if prompt_id in self.queued_event_sent:
+            self.queued_event_sent.remove(prompt_id)
         
         for client_id, mapped_prompt_id in list(self.client_prompts.items()):
             if mapped_prompt_id == prompt_id:
@@ -314,6 +321,11 @@ def _update_workflow_progress(event_name: str, prompt_id: str, client_id: str, d
             }
 
         task_manager.execution_outputs[prompt_id] = {'outputs': {}}
+        
+        # Clear queued event sent status when task starts executing
+        if prompt_id in task_manager.queued_event_sent:
+            task_manager.queued_event_sent.remove(prompt_id)
+        
         ws_manager.ws_event_queue.put((prompt_id, "callback", ("task_started", {
             "prompt_id": prompt_id,
             "client_id": client_id,
@@ -872,13 +884,19 @@ async def api_execute_prompt(request):
             task_manager.callback_urls[prompt_id] = callback_url
             logger.info(f"[comfy-deploy] Set callback URL for task {prompt_id}: {callback_url}")
 
-        ws_manager.ws_event_queue.put((prompt_id, "callback", ("task_queued", {
-            "prompt_id": prompt_id,
-            "client_id": client_id,
-            "status": "queued",
-            "message": "Task queued",
-            "timestamp": int(time.time())
-        })))
+        # Only send task_queued event if not already sent for this prompt_id
+        if prompt_id not in task_manager.queued_event_sent:
+            ws_manager.ws_event_queue.put((prompt_id, "callback", ("task_queued", {
+                "prompt_id": prompt_id,
+                "client_id": client_id,
+                "status": "queued",
+                "message": "Task queued",
+                "timestamp": int(time.time())
+            })))
+            task_manager.queued_event_sent.add(prompt_id)
+            logger.info(f"[comfy-deploy] Sent task_queued event for task {prompt_id}")
+        else:
+            logger.info(f"[comfy-deploy] Skip duplicate task_queued event for task {prompt_id}")
 
         return web.json_response({"prompt_id": prompt_id, "client_id": client_id, "status": "submitted"})
 
@@ -1233,116 +1251,29 @@ async def send_machine_task_update(machine_id, prompt_id, event_name, data=None)
 
     enhanced_data = data
     if enhanced_data is None:
-        prompt_server = server.PromptServer.instance
-
-        queue_info = prompt_server.prompt_queue.get_current_queue()
-        current_tasks = queue_info[0]  # Current executing task
-        queued_tasks = queue_info[1]   # Queued tasks
-
-        is_running = False
-        is_queued = False
-
-        for task in current_tasks:
-            if task[1] == prompt_id:
-                is_running = True
-                break
-
-        if not is_running:
-            for task in queued_tasks:
-                if task[1] == prompt_id:
-                    is_queued = True
-                    break
-
-        # Get task history and progress
-        history = prompt_server.prompt_queue.get_history(prompt_id)
-        history_data = history.get(prompt_id, {}) if history else {}
-        progress_info = task_manager.workflow_progress.get(prompt_id, {})
-        current_progress = progress_info.get('percent', 0)
-
-        # Get current executing node
-        current_node = progress_info.get("current_node")
+        # logger.warning(f"[comfy-deploy] send_machine_task_update called with data=None for task {prompt_id}, skipping")
+        return
+    
+    # Only process and send if data is provided
+    if isinstance(enhanced_data, dict) and "status" in enhanced_data and "live_status" not in enhanced_data:
+        current_node = task_manager.workflow_progress.get(prompt_id, {}).get("current_node")
         active_node = task_manager.workflow_nodes.get(prompt_id, {}).get("active_node")
 
-        # Build status data
-        enhanced_data = {
-            "prompt_id": prompt_id,
-            "client_id": machine_id,
-            "status": "unknown",
-            "progress": current_progress
-        }
-
-        if history_data:
-            status_info = history_data.get('status', {})
-            outputs = history_data.get('outputs', {})
-            completed = status_info.get('completed', False)
-            error = status_info.get('error', False)
-
-            if completed:
-                enhanced_data["status"] = "success" if not error else "failed"
-                enhanced_data["live_status"] = "completed"
-                enhanced_data["completed"] = True
-                enhanced_data["progress"] = 100
-
-                if not error and len(outputs) > 0:
-                    result = {'images': [], 'videos': []}
-                    for output in outputs.values():
-                        if output:
-                            for k, v in output.items():
-                                if 'images' in k:
-                                    result['images'].extend(v)
-                                elif 'videos' in k or 'gifs' in k:
-                                    result['videos'].extend(v)
-                    enhanced_data["result"] = result
-                    enhanced_data["raw_outputs"] = outputs
-
-                if error:
-                    enhanced_data["error"] = status_info.get('error_message', 'Unknown error')
-
-            elif is_running:
-                enhanced_data["status"] = "running"
-                node_id = current_node or active_node
-                if node_id:
-                    node_class_type = get_node_class_type(prompt_id, node_id)
-                    enhanced_data["live_status"] = node_class_type
-                    enhanced_data["node_id"] = node_id
-                else:
-                    enhanced_data["live_status"] = "running"
-
-                enhanced_data["completed"] = False
-                enhanced_data["progress_details"] = progress_info
-
-            elif is_queued:
-                queue_position = 0
-                for i, task in enumerate(queued_tasks):
-                    if task[1] == prompt_id:
-                        queue_position = i + 1
-                        break
-
-                enhanced_data["status"] = "queued"
-                enhanced_data["live_status"] = "queued"
-                enhanced_data["completed"] = False
-                enhanced_data["progress"] = 0
-                enhanced_data["position"] = queue_position
-    else:
-        if isinstance(enhanced_data, dict) and "status" in enhanced_data and "live_status" not in enhanced_data:
-            current_node = task_manager.workflow_progress.get(prompt_id, {}).get("current_node")
-            active_node = task_manager.workflow_nodes.get(prompt_id, {}).get("active_node")
-
-            status = enhanced_data["status"]
-            if status == "success":
-                enhanced_data["live_status"] = "completed"
-            elif status == "failed":
-                enhanced_data["live_status"] = "failed"
-            elif status == "running":
-                node_id = current_node or active_node
-                if node_id:
-                    node_class_type = get_node_class_type(prompt_id, node_id)
-                    enhanced_data["live_status"] = node_class_type
-                    enhanced_data["node_id"] = node_id
-                else:
-                    enhanced_data["live_status"] = "running"
+        status = enhanced_data["status"]
+        if status == "success":
+            enhanced_data["live_status"] = "completed"
+        elif status == "failed":
+            enhanced_data["live_status"] = "failed"
+        elif status == "running":
+            node_id = current_node or active_node
+            if node_id:
+                node_class_type = get_node_class_type(prompt_id, node_id)
+                enhanced_data["live_status"] = node_class_type
+                enhanced_data["node_id"] = node_id
             else:
-                enhanced_data["live_status"] = status
+                enhanced_data["live_status"] = "running"
+        else:
+            enhanced_data["live_status"] = status
 
     try:
         message = {
@@ -1426,6 +1357,9 @@ async def send_callback(prompt_id, event_name, data):
         task_manager.callback_urls.pop(prompt_id, None)
         if prompt_id in task_manager.api_created_tasks:
             task_manager.api_created_tasks.remove(prompt_id)
+        # Clear queued event sent status when task completes
+        if prompt_id in task_manager.queued_event_sent:
+            task_manager.queued_event_sent.remove(prompt_id)
 
 
 # ========================= Utility functions =========================
