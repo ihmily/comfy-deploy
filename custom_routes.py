@@ -27,6 +27,7 @@ class Config:
     # Progress update minimum interval time(seconds)
     PROGRESS_THROTTLE_INTERVAL = 0.5
 
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("comfy-deploy")
 
@@ -40,20 +41,21 @@ class TaskManager:
         # Workflow progress tracking
         self.workflow_nodes = {}  # prompt_id -> {total nodes, completed nodes, node list}
         self.workflow_progress = {}  # prompt_id -> {total percent, current node}
-        
+
         # Throttling control
         self.progress_throttle = {}  # prompt_id -> last time of progress update
-        
+
         # Callback task management
         self.callback_urls = {}  # prompt_id -> callback_url
-        self.client_prompts = {}  # client_id -> prompt_id mapping, for event association
-        
+        self.client_prompts = {}  # client_id -> prompt_id mapping
+        self.prompts_client = {}  # prompt_id -> client_id mapping
+
         # API created tasks list
         self.api_created_tasks = set()  # store task IDs created through API
-        
+
         # Store task outputs
         self.execution_outputs = {}  # prompt_id -> {outputs: {}}
-        
+
         # Track queued event sent status to prevent duplicate sends
         self.queued_event_sent = set()  # store prompt_ids that have already sent task_queued event
 
@@ -61,7 +63,7 @@ class TaskManager:
         if prompt_id in self.api_created_tasks:
             return True
 
-        # Check if there is a callback URL (only API tasks have callback URLs)
+        # Check if there is a callback URL (only API call tasks have callback URLs)
         if prompt_id in self.callback_urls:
             return True
 
@@ -70,33 +72,34 @@ class TaskManager:
 
         return False
 
-    def cleanup_task(self, prompt_id: str) -> None:
+    def cleanup_task(self, prompt_id: str, client_id: str) -> None:
         self.workflow_nodes.pop(prompt_id, None)
         self.workflow_progress.pop(prompt_id, None)
-        
+
         self.progress_throttle.pop(prompt_id, None)
-        
+
         self.callback_urls.pop(prompt_id, None)
-        
+
         if prompt_id in self.api_created_tasks:
             self.api_created_tasks.remove(prompt_id)
-        
+
         self.execution_outputs.pop(prompt_id, None)
-        
-        # Clean up queued event sent status
+
         if prompt_id in self.queued_event_sent:
             self.queued_event_sent.remove(prompt_id)
-        
-        for client_id, mapped_prompt_id in list(self.client_prompts.items()):
-            if mapped_prompt_id == prompt_id:
-                self.client_prompts.pop(client_id, None)
+
+        self.prompts_client.pop(prompt_id, None)
+        if client_id:
+            self.client_prompts.pop(client_id, None)
+        logger.info(f"[Event handling] Task completed, clean up client_id mapping: {client_id} -> {prompt_id}")
+
 
 class WebSocketManager:
     def __init__(self):
         self.task_listeners = defaultdict(list)  # prompt_id -> list of websockets
         self.machine_listeners = {}  # machine_id -> websocket, manage WebSocket connections by machine ID
         self.machine_prompts = defaultdict(set)  # machine_id -> set of prompt_ids
-        
+
         self.ws_event_queue = Queue()
 
 
@@ -104,23 +107,26 @@ config = Config()
 task_manager = TaskManager()
 ws_manager = WebSocketManager()
 
+
 def check_event_handling() -> bool:
     return config.ENABLE_CUSTOM_EVENT_HANDLING
+
 
 def check_verbose_logging() -> bool:
     return config.ENABLE_VERBOSE_LOGGING
 
+
 # ========================= Event handling system =========================
 class EventHandler:
     """Event handler, responsible for registering and dispatching events"""
-    
+
     def __init__(self):
         self.event_callbacks = {}
 
     def register_event(self, event_name: str, callback: callable) -> None:
         """
         Register a callback function for a specified event
-        
+
         Parameters:
             event_name: event name
             callback: callback function, receive event data as parameter
@@ -134,7 +140,7 @@ class EventHandler:
     def handle_event(self, event_name: str, data: Any) -> None:
         """
         Handle events, call all registered callback functions
-        
+
         Parameters:
             event_name: event name
             data: event data
@@ -159,6 +165,7 @@ class EventHandler:
                     logger.error(f"[EventHandler] Error handling event {str_event_name}: {str(e)}")
         elif log_event and check_verbose_logging():
             logger.warning(f"[EventHandler] Received unregistered event: {str_event_name}")
+
 
 event_handler = EventHandler()
 
@@ -213,7 +220,7 @@ def handle_execution_events(event_name: str, data: dict) -> None:
 def handle_execution_events_with_ws_and_callback(event_name: str, data: dict) -> None:
     """
     Handle execution events and send notifications through WebSocket and callback URL
-    
+
     Parameters:
         event_name: event name
         data: event data
@@ -225,7 +232,7 @@ def handle_execution_events_with_ws_and_callback(event_name: str, data: dict) ->
         logger.info(f"[Event handling] Handle event: {event_name}, data: {str(data)[:100]}...")
 
     prompt_id = data.get("prompt_id")
-    client_id = data.get("client_id")
+    client_id = data.get("client_id") or task_manager.prompts_client.get(prompt_id)
 
     if not prompt_id and client_id and client_id in task_manager.client_prompts:
         prompt_id = task_manager.client_prompts[client_id]
@@ -239,40 +246,35 @@ def handle_execution_events_with_ws_and_callback(event_name: str, data: dict) ->
             if check_verbose_logging():
                 logger.warning(f"[Event handling] Event {event_name} has no associated prompt_id or client_id")
         return
-        
+
     if not task_manager.is_api_task(prompt_id):
         return
 
-    # Track workflow progress
+    # API Callback
     _update_workflow_progress(event_name, prompt_id, client_id, data)
-
-    ws_manager.ws_event_queue.put((prompt_id, event_name, data))
-
     callback_data = _prepare_callback_data(event_name, prompt_id, client_id, data)
-    
+
     if callback_data:
         callback_event, event_data = callback_data
-        
+
         if callback_event and event_data and prompt_id in task_manager.callback_urls:
             ws_manager.ws_event_queue.put((prompt_id, "callback", (callback_event, event_data)))
-            
-        # Clean up client_id mapping (if task is completed)
-        if event_name in ["execution_success", "execution_error"] and client_id and client_id in task_manager.client_prompts:
-            logger.info(f"[Event handling] Task completed, clean up client_id mapping: {client_id} -> {prompt_id}")
-            task_manager.client_prompts.pop(client_id, None)
+
+    if event_name in ["execution_success", "execution_error"]:
+        if client_id and client_id in task_manager.client_prompts:
+            ws_manager.ws_event_queue.put((prompt_id, event_name, data))
 
 
 def _update_workflow_progress(event_name: str, prompt_id: str, client_id: str, data: dict) -> None:
     """
     Update task progress and node execution status
-    
+
     Parameters:
         event_name: event name
         prompt_id: task ID
         client_id: client ID
         data: event data
     """
-
 
     if event_name == "execution_start":
         try:
@@ -286,54 +288,115 @@ def _update_workflow_progress(event_name: str, prompt_id: str, client_id: str, d
                     break
 
             if workflow_prompt:
+                total_nodes = len(workflow_prompt)
+
                 task_manager.workflow_nodes[prompt_id] = {
-                    "total": len(workflow_prompt),
+                    "total": total_nodes,
                     "completed": 0,
                     "nodes": list(workflow_prompt.keys()),
                     "active_node": None,
                     "workflow_definition": workflow_prompt  # save full workflow definition
                 }
+
                 task_manager.workflow_progress[prompt_id] = {
                     "percent": 0,
                     "current_node": None,
                     "node_progress": {},  # record progress of each node
                     "execution_order": []  # record node execution order
                 }
-                logger.info(f"[comfy-deploy] Task started executing {prompt_id} contains {len(workflow_prompt)} nodes")
+
+                logger.info(f"[comfy-deploy] Task execution_start executing {prompt_id} contains {total_nodes} nodes")
             else:
                 task_manager.workflow_nodes[prompt_id] = {
-                    "total": 100, "completed": 0, "nodes": [], 
+                    "total": 100, "completed": 0, "nodes": [],
                     "active_node": None, "workflow_definition": {}
                 }
                 task_manager.workflow_progress[prompt_id] = {
-                    "percent": 0, "current_node": None, 
+                    "percent": 0, "current_node": None,
                     "node_progress": {}, "execution_order": []
                 }
         except Exception as e:
             logger.error(f"[comfy-deploy] Error initializing task {prompt_id} progress tracking: {str(e)}")
             task_manager.workflow_nodes[prompt_id] = {
-                "total": 100, "completed": 0, "nodes": [], 
+                "total": 100, "completed": 0, "nodes": [],
                 "active_node": None, "workflow_definition": {}
             }
             task_manager.workflow_progress[prompt_id] = {
-                "percent": 0, "current_node": None, 
+                "percent": 0, "current_node": None,
                 "node_progress": {}, "execution_order": []
             }
 
         task_manager.execution_outputs[prompt_id] = {'outputs': {}}
-        
-        # Clear queued event sent status when task starts executing
-        if prompt_id in task_manager.queued_event_sent:
-            task_manager.queued_event_sent.remove(prompt_id)
-        
-        ws_manager.ws_event_queue.put((prompt_id, "callback", ("task_started", {
-            "prompt_id": prompt_id,
-            "client_id": client_id,
-            "status": "running",
-            "progress": 0,
-            "message": "Task started executing",
-            "timestamp": int(time.time())
-        })))
+
+    elif event_name == "execution_cached":
+        try:
+            prompt_server = server.PromptServer.instance
+            queued_prompts = prompt_server.prompt_queue.get_current_queue()
+
+            workflow_prompt = None
+            for queue_item in queued_prompts[0] + queued_prompts[1]:  # current executing + waiting queue
+                if queue_item[1] == prompt_id:
+                    workflow_prompt = queue_item[2]  # get workflow definition
+                    break
+
+            # Get cached nodes from execution_cached event
+            cached_nodes = data.get("nodes", [])
+            cached_node_count = len(cached_nodes)
+
+            if workflow_prompt:
+                total_nodes = len(workflow_prompt)
+                # For execution_cached, cached nodes are already completed
+                initial_completed = cached_node_count
+                # Calculate initial progress based on cached nodes
+                initial_percent = min(100, int((initial_completed * 100) / total_nodes)) if total_nodes > 0 else 0
+
+                task_manager.workflow_nodes[prompt_id] = {
+                    "total": total_nodes,
+                    "completed": initial_completed,
+                    "nodes": list(workflow_prompt.keys()),
+                    "active_node": None,
+                    "workflow_definition": workflow_prompt  # save full workflow definition
+                }
+
+                # Initialize node progress for cached nodes
+                node_progress = {}
+                for cached_node in cached_nodes:
+                    node_progress[cached_node] = {
+                        "value": 100, "max": 100, "percent": 100
+                    }
+
+                task_manager.workflow_progress[prompt_id] = {
+                    "percent": initial_percent,
+                    "current_node": None,
+                    "node_progress": node_progress,  # record progress of each node
+                    "execution_order": list(cached_nodes)  # record node execution order
+                }
+
+                logger.info(
+                    f"[comfy-deploy] Task {prompt_id} has {cached_node_count} cached nodes, "
+                    f"initial progress: {initial_percent}%, total nodes: {total_nodes}"
+                )
+            else:
+                task_manager.workflow_nodes[prompt_id] = {
+                    "total": 100, "completed": 0, "nodes": [],
+                    "active_node": None, "workflow_definition": {}
+                }
+                task_manager.workflow_progress[prompt_id] = {
+                    "percent": 0, "current_node": None,
+                    "node_progress": {}, "execution_order": []
+                }
+        except Exception as e:
+            logger.error(f"[comfy-deploy] Error initializing task {prompt_id} progress tracking: {str(e)}")
+            task_manager.workflow_nodes[prompt_id] = {
+                "total": 100, "completed": 0, "nodes": [],
+                "active_node": None, "workflow_definition": {}
+            }
+            task_manager.workflow_progress[prompt_id] = {
+                "percent": 0, "current_node": None,
+                "node_progress": {}, "execution_order": []
+            }
+
+        task_manager.execution_outputs[prompt_id] = {'outputs': {}}
 
     elif event_name == "executing":
         # Node started executing
@@ -347,7 +410,6 @@ def _update_workflow_progress(event_name: str, prompt_id: str, client_id: str, d
             if node not in task_manager.workflow_progress[prompt_id]["execution_order"]:
                 task_manager.workflow_progress[prompt_id]["execution_order"].append(node)
 
-            # When node starts executing, increase the number of executed nodes (if this node is not recorded before)
             if node not in task_manager.workflow_progress[prompt_id].get("node_progress", {}):
                 task_manager.workflow_nodes[prompt_id]["completed"] += 1
 
@@ -361,11 +423,11 @@ def _update_workflow_progress(event_name: str, prompt_id: str, client_id: str, d
             if total_nodes <= 0:
                 total_nodes = 1
 
-            progress_percent = min(100, int(((completed_nodes-1) * 100) / total_nodes))
+            progress_percent = min(100, int(((completed_nodes - 1) * 100) / total_nodes))
             task_manager.workflow_progress[prompt_id]["percent"] = progress_percent
 
-            logger.info(f"[comfy-deploy] Task {prompt_id} started executing node {node}, total progress: {progress_percent}%")
-            send_workflow_progress_callback(prompt_id, client_id)
+            logger.info(
+                f"[comfy-deploy] Task {prompt_id} started executing node {node}, total progress: {progress_percent}%")
 
     elif event_name == "executed":
         # Node executed, update progress
@@ -377,7 +439,9 @@ def _update_workflow_progress(event_name: str, prompt_id: str, client_id: str, d
 
             task_manager.execution_outputs[prompt_id]['outputs'][node] = data.get('output', {})
 
-            logger.info(f"[comfy-deploy] Task {prompt_id} node {node} executed, total progress: {task_manager.workflow_progress[prompt_id]['percent']}%")
+            logger.info(
+                f"[comfy-deploy] Task {prompt_id} node {node} executed, total progress: "
+                f"{task_manager.workflow_progress[prompt_id]['percent']}%")
 
             task_manager.workflow_nodes[prompt_id]["active_node"] = None
 
@@ -386,29 +450,28 @@ def _update_workflow_progress(event_name: str, prompt_id: str, client_id: str, d
     elif event_name in ["execution_success", "execution_error"]:
         if prompt_id in task_manager.workflow_progress:
             task_manager.workflow_progress[prompt_id]["percent"] = 100
-            send_workflow_progress_callback(prompt_id, client_id)
-
         logger.info(f"[comfy-deploy] Task {prompt_id} execution ended! Status: {event_name}")
+
 
 def _prepare_callback_data(event_name: str, prompt_id: str, client_id: str, data: dict) -> Optional[Tuple]:
     """
     Prepare callback data based on event type
-    
+
     Parameters:
         event_name: event name
         prompt_id: task ID
         client_id: client ID
         data: event data
-        
+
     Returns:
         Tuple (callback_event, callback_data) or None
     """
     callback_event = None
-    callback_data = None
+    event_data = None
 
-    if event_name == "execution_start":
+    if event_name in ["execution_start"]:
         callback_event = "task_started"
-        callback_data = {
+        event_data = {
             "prompt_id": prompt_id,
             "client_id": client_id,
             "status": "running",
@@ -418,14 +481,14 @@ def _prepare_callback_data(event_name: str, prompt_id: str, client_id: str, data
         }
         if check_verbose_logging():
             logger.info(f"[Event handling] Prepare to send task started callback: {prompt_id}")
-            
+
     elif event_name in ["execution_success", "execution_error"]:
-        # Handle task completion event (whether successful or failed)
+
         is_success = event_name == "execution_success"
         error_msg = data.get("exception_message", "unknown error") if not is_success else None
 
-        # Get output data (if the task is successfully completed)
         result_data = {'images': [], 'videos': []}
+        outputs = {}
         if is_success:
             try:
                 history_data = task_manager.execution_outputs[prompt_id]
@@ -444,7 +507,7 @@ def _prepare_callback_data(event_name: str, prompt_id: str, client_id: str, data
 
         if is_success:
             callback_event = "task_success"
-            callback_data = {
+            event_data = {
                 "prompt_id": prompt_id,
                 "client_id": client_id,
                 "status": "success",
@@ -458,7 +521,7 @@ def _prepare_callback_data(event_name: str, prompt_id: str, client_id: str, data
                 logger.info(f"[Event handling] Prepare to send task success callback: {prompt_id}")
         else:
             callback_event = "task_failed"
-            callback_data = {
+            event_data = {
                 "prompt_id": prompt_id,
                 "client_id": client_id,
                 "status": "failed",
@@ -470,14 +533,14 @@ def _prepare_callback_data(event_name: str, prompt_id: str, client_id: str, data
             if check_verbose_logging():
                 logger.info(f"[Event handling] Prepare to send task failed callback: {prompt_id}, error: {error_msg}")
 
-    return (callback_event, callback_data) if callback_event else None
+    return (callback_event, event_data) if callback_event else None
 
 
 # ========================= Progress tracking and throttling control =========================
 def send_workflow_progress_callback(prompt_id: str, client_id: str) -> None:
     """
     Send workflow progress callback, including node execution information
-    
+
     Parameters:
         prompt_id: task ID
         client_id: client ID
@@ -499,12 +562,13 @@ def send_workflow_progress_callback(prompt_id: str, client_id: str) -> None:
     execution_order = task_manager.workflow_progress.get(prompt_id, {}).get("execution_order", [])
     node_progress = task_manager.workflow_progress.get(prompt_id, {}).get("node_progress", {})
     active_node = task_manager.workflow_nodes.get(prompt_id, {}).get("active_node")
+    status = "running" if workflow_percent < 100 else "completed"
 
     callback_event = "task_workflow_progress"
     callback_data = {
         "prompt_id": prompt_id,
         "client_id": client_id,
-        "status": "running",
+        "status": status,
         "progress": workflow_percent,
         "progress_details": {
             "percent": workflow_percent,
@@ -513,9 +577,10 @@ def send_workflow_progress_callback(prompt_id: str, client_id: str) -> None:
             "completed_nodes": completed_nodes,
             "total_nodes": total_nodes,
             "execution_order": execution_order,
-            "node_progress": node_progress  # progress information of each node
+            "node_progress": node_progress
         },
-        "message": f"Workflow total progress: {workflow_percent}%，executed: {completed_nodes}/{total_nodes} nodes，current node: {current_node}",
+        "message": f"Workflow total progress: {workflow_percent}%, executed: "
+                   f"{completed_nodes}/{total_nodes} nodes, current node: {current_node}",
         "timestamp": int(time.time())
     }
 
@@ -523,10 +588,11 @@ def send_workflow_progress_callback(prompt_id: str, client_id: str) -> None:
     if check_verbose_logging():
         logger.info(f"[comfy-deploy] Send callback for task {prompt_id}: {callback_data}")
 
-def safe_handle_progress(data: dict) -> None:
+
+def handle_progress_event_with_throttle(data: dict) -> None:
     """
     Safe handle progress event, add throttling control
-    
+
     Parameters:
         data: progress event data
     """
@@ -556,7 +622,6 @@ def safe_handle_progress(data: dict) -> None:
         current_time = time.time()
         last_update_time = task_manager.progress_throttle.get(prompt_id, 0)
 
-        # if the interval is long enough, handle the progress event and update the time
         if current_time - last_update_time >= config.PROGRESS_THROTTLE_INTERVAL:
             task_manager.progress_throttle[prompt_id] = current_time
 
@@ -566,9 +631,11 @@ def safe_handle_progress(data: dict) -> None:
                 "progress": workflow_percent,
                 "progress_details": task_manager.workflow_progress.get(prompt_id, {})
             }))
-            
+
             if check_verbose_logging():
-                logger.info(f"[comfy-deploy] Add progress event of task {prompt_id} to WebSocket queue, progress: {workflow_percent}%")
+                logger.info(
+                    f"[comfy-deploy] Add progress event of task {prompt_id} to WebSocket queue, "
+                    f"progress: {workflow_percent}%")
 
         # Clean up throttling record of completed tasks
         for pid in list(task_manager.progress_throttle.keys()):
@@ -586,19 +653,18 @@ def safe_handle_progress(data: dict) -> None:
 original_send_sync = server.PromptServer.send_sync
 
 
-def custom_send_sync(self, event, data, sid=None):
+def custom_send_sync(self, event_name, data, sid=None):
     """
     Modified event sending method, intercept all events
-    
+
     Parameters:
         event_name: event name
         data: event data
         sid: session ID
-        
+
     Returns:
         Original method's return value
     """
-    event_name = event
     # Call original method, ensure original event processing is not affected
     result = original_send_sync(self, event_name, data, sid)
 
@@ -614,7 +680,8 @@ def custom_send_sync(self, event, data, sid=None):
 
             if any(keyword in str_event_name for keyword in ["execution", "prompt", "executed", "executing"]):
                 if check_verbose_logging():
-                    logger.warning(f"[Important event] Capture execution related event: {str_event_name}, full data: {str(data)}")
+                    logger.warning(
+                        f"[Important event] Capture execution related event: {str_event_name}, full data: {str(data)}")
 
         event_handler.handle_event(str_event_name, data)
     except Exception as e:
@@ -628,55 +695,62 @@ server.PromptServer.send_sync = custom_send_sync
 
 
 # ========================= Task execution and management =========================
+def is_task_in_waiting_queue(prompt_id: str) -> bool:
+    """
+    Check if a task is in the waiting queue (not immediately executing)
+
+    Parameters:
+        prompt_id: Task ID to check
+
+    Returns:
+        True if the task is in waiting queue, False if it will immediately execute
+    """
+    try:
+        prompt_server = server.PromptServer.instance
+        queue_info = prompt_server.prompt_queue.get_current_queue()
+        current_tasks = queue_info[0]  # Currently executing tasks
+        queued_tasks = queue_info[1]  # Waiting tasks
+
+        # Check if the task is in the waiting queue
+        return any(task[1] == prompt_id for task in queued_tasks)
+    except Exception as e:
+        logger.error(f"[comfy-deploy] Error checking queue status for task {prompt_id}: {str(e)}")
+        return True
+
+
 def random_seed():
     return random.randint(0, 1125899906842624)
 
+
 def apply_random_seed_to_workflow(workflow_api):
-    for node_id, _ in workflow_api.items():
-        if "inputs" in workflow_api[node_id]:
-            if "seed" in workflow_api[node_id]["inputs"]:
-                if isinstance(workflow_api[node_id]["inputs"]["seed"], list):
-                    continue
-                workflow_api[node_id]["inputs"]['seed'] = random_seed()
-                key = node_id
-                if "noise_seed" in workflow_api[key]["inputs"]:
-                    if isinstance(workflow_api[key]["inputs"]["noise_seed"], list):
-                        continue
-                    if workflow_api[key]["class_type"] == "RandomNoise":
-                        workflow_api[key]["inputs"]["noise_seed"] = random_seed()
-                        logger.info(
-                            f"Applied random noise_seed {workflow_api[key]['inputs']['noise_seed']} to RandomNoise"
-                        )
-                        continue
-                    if workflow_api[key]["class_type"] == "KSamplerAdvanced":
-                        workflow_api[key]["inputs"]["noise_seed"] = random_seed()
-                        logger.info(
-                            f"Applied random noise_seed {workflow_api[key]['inputs']['noise_seed']} to KSamplerAdvanced"
-                        )
-                        continue
-                    if workflow_api[key]["class_type"] == "SamplerCustom":
-                        workflow_api[key]["inputs"]["noise_seed"] = random_seed()
-                        logger.info(
-                            f"Applied random noise_seed {workflow_api[key]['inputs']['noise_seed']} to SamplerCustom"
-                        )
-                        continue
-                    if workflow_api[key]["class_type"] == "XlabsSampler":
-                        workflow_api[key]["inputs"]["noise_seed"] = random_seed()
-                        logger.info(
-                            f"Applied random noise_seed {workflow_api[key]['inputs']['noise_seed']} to XlabsSampler"
-                        )
-                        continue
+    NOISE_SEED_NODE_TYPES = {"RandomNoise", "KSamplerAdvanced", "SamplerCustom", "XlabsSampler"}
+
+    for node_id, node_data in workflow_api.items():
+        inputs = node_data.get("inputs")
+        if not inputs:
+            continue
+
+        if "seed" in inputs and not isinstance(inputs["seed"], list):
+            inputs["seed"] = random_seed()
+
+            if "noise_seed" in inputs and not isinstance(inputs["noise_seed"], list):
+                class_type = node_data.get("class_type")
+                if class_type in NOISE_SEED_NODE_TYPES:
+                    inputs["noise_seed"] = random_seed()
+                    logger.info(
+                        f"{node_id} Applied random noise_seed {inputs['noise_seed']} to {class_type}"
+                    )
 
 
 async def execute_prompt(prompt: dict, client_id: str = None, pre_prompt_id: str = None) -> str:
     """
     Execute ComfyUI workflow task
-    
+
     Parameters:
         prompt: ComfyUI workflow JSON
         client_id: optional client ID
         pre_prompt_id: optional preset prompt_id, if provided, use this ID instead of generating a new one
-        
+
     Returns:
         Task ID
     """
@@ -708,7 +782,7 @@ async def execute_prompt(prompt: dict, client_id: str = None, pre_prompt_id: str
     }
     # ComfyUI v0.3.67 and above add sensitive data field
     sensitive_data = {}
-    #logger.info(f"[comfy-deploy] Set client_id for task {prompt_id}: {client_id}")
+    # logger.info(f"[comfy-deploy] Set client_id for task {prompt_id}: {client_id}")
 
     # Get output nodes
     outputs_to_execute = valid[2]
@@ -723,9 +797,10 @@ async def execute_prompt(prompt: dict, client_id: str = None, pre_prompt_id: str
 
     # Mark task as API created task
     task_manager.api_created_tasks.add(prompt_id)
-    
+
     # Save client_id and prompt_id mapping
     task_manager.client_prompts[client_id] = prompt_id
+    task_manager.prompts_client[prompt_id] = client_id
     # logger.info(f"[comfy-deploy] Save client_id mapping: {client_id} -> {prompt_id}")
 
     return prompt_id
@@ -734,21 +809,21 @@ async def execute_prompt(prompt: dict, client_id: str = None, pre_prompt_id: str
 def get_task_details(prompt_id: str) -> dict:
     """
     Get task details
-    
+
     Parameters:
         prompt_id: Task ID
-        
+
     Returns:
         Task details dictionary
     """
     prompt_server = server.PromptServer.instance
     history = prompt_server.prompt_queue.get_history(prompt_id)
-    
+
     if not history or prompt_id not in history:
         queue_info = prompt_server.prompt_queue.get_current_queue()
         current_tasks = queue_info[0]
         queued_tasks = queue_info[1]
-        
+
         for task in current_tasks:
             if task[1] == prompt_id:
                 return {
@@ -757,7 +832,7 @@ def get_task_details(prompt_id: str) -> dict:
                     "progress": task_manager.workflow_progress.get(prompt_id, {}).get("percent", 0),
                     "current_node": task_manager.workflow_progress.get(prompt_id, {}).get("current_node")
                 }
-                
+
         for i, task in enumerate(queued_tasks):
             if task[1] == prompt_id:
                 return {
@@ -765,13 +840,13 @@ def get_task_details(prompt_id: str) -> dict:
                     "status": "queued",
                     "position": i + 1
                 }
-                
+
         return None
-    
+
     history_data = history.get(prompt_id, {})
     status_info = history_data.get('status', {})
     outputs = history_data.get('outputs', {})
-    
+
     result = {
         "prompt_id": prompt_id,
         "status": status_info.get('status_str', 'unknown'),
@@ -779,10 +854,10 @@ def get_task_details(prompt_id: str) -> dict:
         "has_output": len(outputs) > 0,
         "outputs": outputs
     }
-    
+
     if status_info.get('completed', False) and not status_info.get('error', False):
         result["raw_outputs"] = outputs
-    
+
     return result
 
 
@@ -804,44 +879,7 @@ def get_prompt_history() -> dict:
             return {}
 
 
-
 # ========================= API endpoints and routes =========================
-@server.PromptServer.instance.routes.get("/api/v1/toggle_event_listener")
-async def toggle_event_listener(request):
-    """API endpoints for enabling or disabling event listener"""
-    enable = request.query.get("enable", None)
-
-    if enable is not None:
-        if enable.lower() == "true":
-            config.ENABLE_CUSTOM_EVENT_HANDLING = True
-            logger.info("[comfy-deploy] Event listener enabled")
-        elif enable.lower() == "false":
-            config.ENABLE_CUSTOM_EVENT_HANDLING = False
-            logger.info("[comfy-deploy] Event listener disabled")
-
-    return web.json_response({
-        "event_listener_enabled": check_event_handling()
-    })
-
-
-@server.PromptServer.instance.routes.get("/api/v1/toggle_verbose_logging")
-async def toggle_verbose_logging(request):
-    """API endpoints for enabling or disabling verbose logging"""
-    enable = request.query.get("enable", None)
-
-    if enable is not None:
-        if enable.lower() == "true":
-            config.ENABLE_VERBOSE_LOGGING = True
-            logger.info("[comfy-deploy] Verbose logging enabled")
-        elif enable.lower() == "false":
-            config.ENABLE_VERBOSE_LOGGING = False
-            logger.info("[comfy-deploy] Verbose logging disabled")
-
-    return web.json_response({
-        "verbose_logging_enabled": check_verbose_logging()
-    })
-
-
 @server.PromptServer.instance.routes.post("/api/v1/execute")
 async def api_execute_prompt(request):
     """API endpoints for submitting task execution"""
@@ -856,6 +894,10 @@ async def api_execute_prompt(request):
 
         if not prompt:
             return web.json_response({"error": "No workflow data provided"}, status=400)
+
+        if callback_url:
+            task_manager.callback_urls[pre_prompt_id] = callback_url
+            logger.info(f"[comfy-deploy] Set callback URL for task {pre_prompt_id}: {callback_url}")
 
         prompt_id = await execute_prompt(prompt, client_id=client_id, pre_prompt_id=pre_prompt_id)
 
@@ -880,12 +922,11 @@ async def api_execute_prompt(request):
                 }))
                 logger.info(f"[comfy-deploy] Send task created notification to machine {client_id}")
 
-        if callback_url:
-            task_manager.callback_urls[prompt_id] = callback_url
-            logger.info(f"[comfy-deploy] Set callback URL for task {prompt_id}: {callback_url}")
+        # Only send task_queued event if the task is actually queued (not immediately executing)
+        # Check if there are tasks in queue before this one
+        is_in_waiting_queue = is_task_in_waiting_queue(prompt_id)
 
-        # Only send task_queued event if not already sent for this prompt_id
-        if prompt_id not in task_manager.queued_event_sent:
+        if is_in_waiting_queue and prompt_id not in task_manager.queued_event_sent:
             ws_manager.ws_event_queue.put((prompt_id, "callback", ("task_queued", {
                 "prompt_id": prompt_id,
                 "client_id": client_id,
@@ -894,9 +935,12 @@ async def api_execute_prompt(request):
                 "timestamp": int(time.time())
             })))
             task_manager.queued_event_sent.add(prompt_id)
-            logger.info(f"[comfy-deploy] Sent task_queued event for task {prompt_id}")
+            logger.info(f"[comfy-deploy] Sent task_queued event for task {prompt_id} (in waiting queue)")
         else:
-            logger.info(f"[comfy-deploy] Skip duplicate task_queued event for task {prompt_id}")
+            if is_in_waiting_queue:
+                logger.info(f"[comfy-deploy] Skip duplicate task_queued event for task {prompt_id}")
+            else:
+                logger.info(f"[comfy-deploy] Skip task_queued event for task {prompt_id} (immediately executing)")
 
         return web.json_response({"prompt_id": prompt_id, "client_id": client_id, "status": "submitted"})
 
@@ -916,10 +960,10 @@ async def api_get_prompt_status(request):
             return web.json_response({"error": "No task ID provided"}, status=400)
 
         task_details = get_task_details(prompt_id)
-        
+
         if not task_details:
             return web.json_response({"error": "Task not found"}, status=404)
-            
+
         return web.json_response(task_details)
 
     except Exception as e:
@@ -940,12 +984,12 @@ async def api_get_output(request):
             return web.json_response({"error": "No task ID or node ID provided"}, status=400)
 
         task_details = get_task_details(prompt_id)
-        
+
         if not task_details:
             return web.json_response({"error": "Task not found"}, status=404)
-            
+
         outputs = task_details.get('outputs', {})
-        
+
         if node_id not in outputs:
             return web.json_response({"error": "Node output not found"}, status=404)
 
@@ -965,7 +1009,7 @@ async def api_get_output(request):
 
 
 @server.PromptServer.instance.routes.get("/comfy-deploy/status")
-async def get_hello(_):
+async def get_comfy_deploy_status(_):
     """Health check endpoint"""
     return web.json_response({
         "status": "ok",
@@ -1036,66 +1080,6 @@ async def machine_websocket_handler(request):
 async def send_task_update(prompt_id, event_name, data):
     enhanced_data = data.copy() if isinstance(data, dict) else {"original_data": data}
 
-    if event_name == "status" and isinstance(enhanced_data, dict):
-        # Get progress information
-        progress = task_manager.workflow_progress.get(prompt_id, {}).get('percent', 0)
-        enhanced_data["progress"] = progress
-
-        # Get current executing node
-        current_node = task_manager.workflow_progress.get(prompt_id, {}).get("current_node")
-        active_node = task_manager.workflow_nodes.get(prompt_id, {}).get("active_node")
-
-        if "status" in enhanced_data:
-            status = enhanced_data["status"]
-            if status == "completed":
-                enhanced_data["status"] = "success"
-                enhanced_data["live_status"] = "completed"
-            elif status in ["error", "failed"]:
-                enhanced_data["status"] = "failed"
-                enhanced_data["live_status"] = "failed"
-            else:
-                # Use current node's class_type as live_status
-                node_id = current_node or active_node
-                if node_id:
-                    node_class_type = get_node_class_type(prompt_id, node_id)
-                    enhanced_data["live_status"] = node_class_type
-                    enhanced_data["node_id"] = node_id
-                else:
-                    enhanced_data["live_status"] = status
-
-    if event_name == "progress" and isinstance(enhanced_data, dict):
-        if "status" not in enhanced_data:
-            enhanced_data["status"] = "running"
-
-        # Get current executing node
-        current_node = task_manager.workflow_progress.get(prompt_id, {}).get("current_node")
-        active_node = task_manager.workflow_nodes.get(prompt_id, {}).get("active_node")
-
-        # Use current node's class_type as live_status
-        node_id = current_node or active_node
-        if node_id:
-            # Get node's type name
-            node_class_type = get_node_class_type(prompt_id, node_id)
-            enhanced_data["live_status"] = node_class_type
-            # Keep node ID as extra information
-            enhanced_data["node_id"] = node_id
-        else:
-            enhanced_data["live_status"] = "running"
-
-        # Get workflow progress information
-        progress = task_manager.workflow_progress.get(prompt_id, {}).get('percent', 0)
-        enhanced_data["progress"] = progress
-
-        enhanced_data["progress_details"] = task_manager.workflow_progress.get(prompt_id, {})
-
-        # Add detailed node information
-        if prompt_id in task_manager.workflow_nodes:
-            enhanced_data["node_info"] = task_manager.workflow_nodes[prompt_id]
-
-        # Get node type name for logging
-        node_name = enhanced_data["live_status"]
-        # logger.info(f"[comfy-deploy] WebSocket send task {prompt_id} progress event: {progress}%，current node: {node_name} (ID: {node_id})")
-
     if event_name == "task_workflow_progress":
         if "status" not in enhanced_data:
             enhanced_data["status"] = "running"
@@ -1113,19 +1097,23 @@ async def send_task_update(prompt_id, event_name, data):
             enhanced_data["live_status"] = "running"
 
         if "progress" in enhanced_data:
-            node_name = enhanced_data["live_status"]
-            # logger.info(f"[comfy-deploy] WebSocket task {prompt_id} progress update: {enhanced_data['progress']}%，current node: {node_name} (ID: {node_id})")
+            # node_name = enhanced_data["live_status"]
+            # logger.info(f"[comfy-deploy] WebSocket task {prompt_id} progress update: {enhanced_data['progress']}%,"
+            #             f"current node: {node_name} (ID: {node_id})")
 
             try:
                 enhanced_data["progress"] = int(enhanced_data["progress"])
             except (ValueError, TypeError):
                 enhanced_data["progress"] = 0
+
         elif "progress_details" in enhanced_data and "percent" in enhanced_data["progress_details"]:
             enhanced_data["progress"] = enhanced_data["progress_details"]["percent"]
             node_name = enhanced_data["live_status"]
-            logger.info(f"[comfy-deploy] WebSocket task {prompt_id} progress update (from details): {enhanced_data['progress']}%，current node: {node_name} (ID: {node_id})")
+            logger.info(
+                f"[comfy-deploy] WebSocket task {prompt_id} progress update (from details): "
+                f"{enhanced_data['progress']}%, current node: {node_name} (ID: {node_id})")
 
-    if event_name in ["execution_success", "task_success"]:
+    if event_name in ["execution_success"]:
         enhanced_data["status"] = "success"
         enhanced_data["live_status"] = "completed"
         enhanced_data["progress"] = 100
@@ -1149,11 +1137,11 @@ async def send_task_update(prompt_id, event_name, data):
                                 result['videos'].extend(v)
 
                 enhanced_data["result"] = result
-                enhanced_data["raw_outputs"] = outputs  # Add original outputs results
+                enhanced_data["raw_outputs"] = outputs
         except Exception as e:
             logger.error(f"Error getting task {prompt_id} results: {str(e)}")
 
-    if event_name in ["execution_error", "task_failed"]:
+    if event_name in ["execution_error"]:
         enhanced_data["status"] = "failed"
         enhanced_data["live_status"] = "failed"
         enhanced_data["completed"] = True
@@ -1162,8 +1150,6 @@ async def send_task_update(prompt_id, event_name, data):
             enhanced_data["error"] = data.exception_message
 
     # Record all event sending
-    # logger.info(f"[comfy-deploy] WebSocket send task {prompt_id}, event: {event_name}, data type: {type(enhanced_data).__name__}")
-
     if prompt_id in ws_manager.task_listeners:
         closed_ws = []
 
@@ -1191,9 +1177,13 @@ async def send_task_update(prompt_id, event_name, data):
                 closed_ws.append(ws)
 
         if message_sent:
-            logger.info(f"[comfy-deploy] WebSocket successfully sent {event_name} event to {len(ws_manager.task_listeners[prompt_id]) - len(closed_ws)} clients of task {prompt_id}")
+            logger.info(
+                f"[comfy-deploy] WebSocket successfully sent {event_name} event to "
+                f"{len(ws_manager.task_listeners[prompt_id]) - len(closed_ws)} clients of task {prompt_id}")
         else:
-            logger.warning(f"[comfy-deploy] WebSocket warning, {event_name} event cannot be sent to any client of task {prompt_id}")
+            logger.warning(
+                f"[comfy-deploy] WebSocket warning, {event_name} event cannot be sent to any client of task {prompt_id}"
+            )
 
         for ws in closed_ws:
             if ws in ws_manager.task_listeners[prompt_id]:
@@ -1213,7 +1203,6 @@ async def send_machine_updates_for_task(prompt_id, event_name, data):
     """Send task update to all associated machine WebSocket"""
     related_machines = []
 
-    # 1. First try to find the corresponding machine ID (client_id) through client_prompts
     for machine_id, mapped_prompt_id in task_manager.client_prompts.items():
         if mapped_prompt_id == prompt_id:
             related_machines.append(machine_id)
@@ -1223,7 +1212,6 @@ async def send_machine_updates_for_task(prompt_id, event_name, data):
             else:
                 ws_manager.machine_prompts[machine_id] = {prompt_id}
 
-    # 2. Then check all known machine task lists
     for machine_id, prompt_ids in ws_manager.machine_prompts.items():
         if prompt_id in prompt_ids and machine_id not in related_machines:
             related_machines.append(machine_id)
@@ -1251,9 +1239,8 @@ async def send_machine_task_update(machine_id, prompt_id, event_name, data=None)
 
     enhanced_data = data
     if enhanced_data is None:
-        # logger.warning(f"[comfy-deploy] send_machine_task_update called with data=None for task {prompt_id}, skipping")
         return
-    
+
     # Only process and send if data is provided
     if isinstance(enhanced_data, dict) and "status" in enhanced_data and "live_status" not in enhanced_data:
         current_node = task_manager.workflow_progress.get(prompt_id, {}).get("current_node")
@@ -1309,7 +1296,7 @@ async def process_ws_event_queue():
                     callback_event_name, callback_data = data
                     await send_callback(prompt_id, callback_event_name, callback_data)
                 else:
-                    # Process WebSocket notification
+                    # Process WebSocket notification (for comfy-deploy-admin web UI)
                     await send_task_update(prompt_id, event_type, data)
 
             # Check queue every 100ms
@@ -1320,7 +1307,6 @@ async def process_ws_event_queue():
 
 
 async def send_callback(prompt_id, event_name, data):
-
     if not check_event_handling():
         return
 
@@ -1354,23 +1340,18 @@ async def send_callback(prompt_id, event_name, data):
         logger.error(f"[comfy-deploy] Error sending {event_name} event: {str(e)}")
 
     if event_name in ["task_success", "task_failed"]:
-        task_manager.callback_urls.pop(prompt_id, None)
-        if prompt_id in task_manager.api_created_tasks:
-            task_manager.api_created_tasks.remove(prompt_id)
-        # Clear queued event sent status when task completes
-        if prompt_id in task_manager.queued_event_sent:
-            task_manager.queued_event_sent.remove(prompt_id)
+        task_manager.cleanup_task(prompt_id, data.get('client_id'))
 
 
 # ========================= Utility functions =========================
 def get_node_class_type(prompt_id: str, node_id: str) -> str:
     """
     Get node type name from workflow definition
-    
+
     Parameters:
         prompt_id: task ID
         node_id: node ID
-        
+
     Returns:
         Node type name, if not found, return node ID
     """
@@ -1389,29 +1370,28 @@ def get_node_class_type(prompt_id: str, node_id: str) -> str:
 
 
 # ========================= Event registration and initialization =========================
-# Register ComfyUI event handler
-event_handler.register_event("execution_start",
-                             lambda data: handle_execution_events_with_ws_and_callback("execution_start", data))
-event_handler.register_event("execution_cached",
-                             lambda data: handle_execution_events_with_ws_and_callback("execution_cached", data))
-event_handler.register_event("executing", lambda data: handle_execution_events_with_ws_and_callback("executing", data))
-event_handler.register_event("executed", lambda data: handle_execution_events_with_ws_and_callback("executed", data))
-event_handler.register_event("execution_error",
-                             lambda data: handle_execution_events_with_ws_and_callback("execution_error", data))
-event_handler.register_event("execution_success",
-                             lambda data: handle_execution_events_with_ws_and_callback("execution_success", data))
-
-# Register progress event handler
-event_handler.register_event("progress", safe_handle_progress)
-
+# Register ComfyUI event handlers
+event_handler.register_event("progress", handle_progress_event_with_throttle)
+EXECUTION_EVENTS = [
+    "execution_start",
+    "execution_cached",
+    "executing",
+    "executed",
+    "execution_error",
+    "execution_success"
+]
+for _event_name in EXECUTION_EVENTS:
+    event_handler.register_event(
+        _event_name,
+        lambda data, event=_event_name: handle_execution_events_with_ws_and_callback(event, data)
+    )
 
 logger.info("[ComfyDeploy] custom routes initialization completed")
+logger.info("Registered API endpoint: /comfy-deploy/status")
 logger.info("Registered API endpoint: /api/v1/execute")
 logger.info("Registered API endpoint: /api/v1/status/{prompt_id}")
 logger.info("Registered API endpoint: /api/v1/output/{prompt_id}/{node_id}")
 logger.info("Registered WebSocket endpoint: /api/v1/ws/task/{prompt_id}")
 logger.info("Registered WebSocket endpoint: /api/v1/ws/machine/{machine_id}")
-logger.info("Registered API endpoint: /api/v1/toggle_event_listener")
-logger.info("Registered API endpoint: /api/v1/toggle_verbose_logging")
 logger.info(f"Detailed logging status: {'Enabled' if check_verbose_logging() else 'Disabled'}")
-logger.info(f"[ComfyDeploy] initialization completed, event listener status: {'Enabled' if check_event_handling() else 'Disabled'}")
+logger.info(f"[ComfyDeploy] Event listener status: {'Enabled' if check_event_handling() else 'Disabled'}")
