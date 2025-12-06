@@ -62,9 +62,40 @@ class comfyDeploy extends LGraphNode {
     onConfigure(o) {
         if (o.properties) {
             this.properties = { ...this.properties, ...o.properties };
-            this.widgets[0].value = this.properties.workflow_name || "";
-            this.widgets[1].value = this.properties.workflow_id || "";
-            this.widgets[2].value = this.properties.version || "";
+            if (this.widgets && this.widgets.length >= 3) {
+                this.widgets[0].value = this.properties.workflow_name || "";
+                this.widgets[1].value = this.properties.workflow_id || "";
+                this.widgets[2].value = this.properties.version || "";
+            }
+        }
+    }
+    
+    // Override setProperty for Vue nodes compatibility
+    setProperty(name, value) {
+        if (this.properties) {
+            this.properties[name] = value;
+        }
+        
+        // Update corresponding widget
+        const widgetMap = {
+            'workflow_name': 0,
+            'workflow_id': 1,
+            'version': 2
+        };
+        
+        if (widgetMap.hasOwnProperty(name) && this.widgets) {
+            const widgetIndex = widgetMap[name];
+            if (this.widgets[widgetIndex]) {
+                this.widgets[widgetIndex].value = value;
+                if (this.widgets[widgetIndex].callback) {
+                    this.widgets[widgetIndex].callback(value);
+                }
+            }
+        }
+        
+        // Mark graph as dirty to trigger re-render
+        if (this.graph) {
+            this.graph.setDirtyCanvas(true, true);
         }
     }
 

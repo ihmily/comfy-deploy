@@ -785,13 +785,46 @@ function updateOrCreateDeployNode(workflowName, workflowId, version) {
     } else {
         const deployNode = deployNodes[0];
         
+        // Update properties
         deployNode.properties.workflow_name = workflowName;
         deployNode.properties.workflow_id = workflowId;
         deployNode.properties.version = version;
         
-        deployNode.widgets[0].value = workflowName;
-        deployNode.widgets[1].value = workflowId;
-        deployNode.widgets[2].value = version;
+        // Update widgets with callback trigger for Vue compatibility
+        if (deployNode.widgets && deployNode.widgets.length >= 3) {
+            // Update widget values and trigger callbacks
+            const widget0 = deployNode.widgets[0];
+            const widget1 = deployNode.widgets[1];
+            const widget2 = deployNode.widgets[2];
+            
+            widget0.value = workflowName;
+            if (widget0.callback) {
+                widget0.callback(workflowName);
+            }
+            
+            widget1.value = workflowId;
+            if (widget1.callback) {
+                widget1.callback(workflowId);
+            }
+            
+            widget2.value = version;
+            if (widget2.callback) {
+                widget2.callback(version);
+            }
+        }
+        
+        // Use setProperty if available (for Vue nodes compatibility)
+        if (typeof deployNode.setProperty === 'function') {
+            deployNode.setProperty('workflow_name', workflowName);
+            deployNode.setProperty('workflow_id', workflowId);
+            deployNode.setProperty('version', version);
+        }
+        
+        // Trigger node serialization to ensure changes are saved
+        if (typeof deployNode.onSerialize === 'function') {
+            const serialized = {};
+            deployNode.onSerialize(serialized);
+        }
         
         app.graph.setDirtyCanvas(true, true);
         app.graph.change();
