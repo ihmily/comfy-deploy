@@ -718,8 +718,11 @@ def is_task_in_waiting_queue(prompt_id: str) -> bool:
         return True
 
 
-def random_seed():
-    return random.randint(0, 1125899906842624)
+def random_seed(length=15):
+    if length==15:
+        return random.randint(0, 1125899906842624)
+    else:
+        return random.randint(0, 2147483647)
 
 
 def apply_random_seed_to_workflow(workflow_api):
@@ -731,12 +734,12 @@ def apply_random_seed_to_workflow(workflow_api):
             continue
 
         if "seed" in inputs and not isinstance(inputs["seed"], list):
-            inputs["seed"] = random_seed()
+            inputs["seed"] = random_seed(length=len(str(inputs["seed"])))
 
             if "noise_seed" in inputs and not isinstance(inputs["noise_seed"], list):
                 class_type = node_data.get("class_type")
                 if class_type in NOISE_SEED_NODE_TYPES:
-                    inputs["noise_seed"] = random_seed()
+                    inputs["noise_seed"] = random_seed(length=len(str(inputs["noise_seed"])))
                     logger.info(
                         f"{node_id} Applied random noise_seed {inputs['noise_seed']} to {class_type}"
                     )
