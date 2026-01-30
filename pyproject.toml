@@ -1,7 +1,7 @@
 [project]
 name = "comfy-deploy"
 description = "Easy deploy API for ComfyUI."
-version = "1.0.4"
+version = "1.0.5"
 license = { file = "LICENSE" }
 dependencies = ["numpy", "pillow", "torch", "opencv-python", "httpx>=0.28.1", "pycryptodome"]
 
