@@ -487,7 +487,7 @@ def _prepare_callback_data(event_name: str, prompt_id: str, client_id: str, data
         is_success = event_name == "execution_success"
         error_msg = data.get("exception_message", "unknown error") if not is_success else None
 
-        result_data = {'images': [], 'videos': []}
+        result_data = {'images': [], 'videos': [], '3d': []}
         outputs = {}
         if is_success:
             try:
@@ -496,10 +496,12 @@ def _prepare_callback_data(event_name: str, prompt_id: str, client_id: str, data
                 for output in outputs.values():
                     if output:
                         for k, v in output.items():
-                            if 'images' in k:
+                            if 'images' in k or 'gifs' in k:
                                 result_data['images'].extend(v)
-                            elif 'videos' in k or 'gifs' in k:
+                            elif 'videos' in k:
                                 result_data['videos'].extend(v)
+                            elif '3d' in k:
+                                result_data['3d'].extend(v)
                 if check_verbose_logging():
                     logger.info(f"[Event handling] Get output of task {prompt_id}: {len(outputs)} nodes")
             except Exception as e:
@@ -1130,14 +1132,16 @@ async def send_task_update(prompt_id, event_name, data):
                 outputs = history_data.get('outputs', {})
 
                 # Extract output results
-                result = {'images': [], 'videos': []}
+                result = {'images': [], 'videos': [], '3d': []}
                 for output in outputs.values():
                     if output:
                         for k, v in output.items():
-                            if 'images' in k:
+                            if 'images' in k or 'gifs' in k:
                                 result['images'].extend(v)
-                            elif 'videos' in k or 'gifs' in k:
+                            elif 'videos' in k:
                                 result['videos'].extend(v)
+                            elif '3d' in k:
+                                result['3d'].extend(v)
 
                 enhanced_data["result"] = result
                 enhanced_data["raw_outputs"] = outputs
