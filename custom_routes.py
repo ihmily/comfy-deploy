@@ -67,7 +67,7 @@ class TaskManager:
         if prompt_id in self.callback_urls:
             return True
 
-        if prompt_id in [mapped_id for mapped_id in self.client_prompts.values()]:
+        if prompt_id in self.prompts_client:
             return True
 
         return False
@@ -721,10 +721,10 @@ def is_task_in_waiting_queue(prompt_id: str) -> bool:
 
 
 def random_seed(length=15):
-    if length==15:
-        return random.randint(0, 1125899906842624)
-    else:
-        return random.randint(0, 2147483647)
+    length = min(15, max(1, int(length)))
+    min_value = 0 if length == 1 else 10 ** (length - 1)
+    max_value = 10 ** length - 1
+    return random.randint(min_value, max_value)
 
 
 def apply_random_seed_to_workflow(workflow_api):
@@ -738,13 +738,13 @@ def apply_random_seed_to_workflow(workflow_api):
         if "seed" in inputs and not isinstance(inputs["seed"], list):
             inputs["seed"] = random_seed(length=len(str(inputs["seed"])))
 
-            if "noise_seed" in inputs and not isinstance(inputs["noise_seed"], list):
-                class_type = node_data.get("class_type")
-                if class_type in NOISE_SEED_NODE_TYPES:
-                    inputs["noise_seed"] = random_seed(length=len(str(inputs["noise_seed"])))
-                    logger.info(
-                        f"{node_id} Applied random noise_seed {inputs['noise_seed']} to {class_type}"
-                    )
+        if "noise_seed" in inputs and not isinstance(inputs["noise_seed"], list):
+            class_type = node_data.get("class_type")
+            if class_type in NOISE_SEED_NODE_TYPES:
+                inputs["noise_seed"] = random_seed(length=len(str(inputs["noise_seed"])))
+                logger.info(
+                    f"{node_id} Applied random noise_seed {inputs['noise_seed']} to {class_type}"
+                )
 
 
 async def execute_prompt(prompt: dict, client_id: str = None, pre_prompt_id: str = None) -> str:
@@ -893,21 +893,25 @@ async def api_execute_prompt(request):
         prompt = json_data.get("prompt")
         callback_url = json_data.get("callback_url")
 
-        pre_prompt_id = json_data.get("task_id")
-
-        client_id = json_data.get("client_id") or f"comfy-deploy-{int(time.time())}"
+        prompt_id = json_data.get("task_id") or str(uuid.uuid4())
+        client_id = json_data.get("client_id") or f"comfy-deploy-client-{prompt_id[:8]}"
 
         if not prompt:
             return web.json_response({"error": "No workflow data provided"}, status=400)
 
+        submitted_prompt_id = None
+
         if callback_url:
-            task_manager.callback_urls[pre_prompt_id] = callback_url
-            logger.info(f"[comfy-deploy] Set callback URL for task {pre_prompt_id}: {callback_url}")
+            task_manager.callback_urls[prompt_id] = callback_url
+            logger.info(f"[comfy-deploy] Set callback URL for task {prompt_id}: {callback_url}")
 
-        prompt_id = await execute_prompt(prompt, client_id=client_id, pre_prompt_id=pre_prompt_id)
+        submitted_prompt_id = await execute_prompt(prompt, client_id=client_id, pre_prompt_id=prompt_id)
 
-        if not prompt_id:
+        if not submitted_prompt_id:
+            task_manager.callback_urls.pop(prompt_id, None)
             return web.json_response({"error": "Task validation failed"}, status=400)
+
+        prompt_id = submitted_prompt_id
 
         # If client_id is machine ID, add task to machine associated task set
         if client_id in ws_manager.machine_listeners or client_id in ws_manager.machine_prompts:
@@ -932,15 +936,18 @@ async def api_execute_prompt(request):
         is_in_waiting_queue = is_task_in_waiting_queue(prompt_id)
 
         if is_in_waiting_queue and prompt_id not in task_manager.queued_event_sent:
-            ws_manager.ws_event_queue.put((prompt_id, "callback", ("task_queued", {
-                "prompt_id": prompt_id,
-                "client_id": client_id,
-                "status": "queued",
-                "message": "Task queued",
-                "timestamp": int(time.time())
-            })))
+            if prompt_id in task_manager.callback_urls:
+                ws_manager.ws_event_queue.put((prompt_id, "callback", ("task_queued", {
+                    "prompt_id": prompt_id,
+                    "client_id": client_id,
+                    "status": "queued",
+                    "message": "Task queued",
+                    "timestamp": int(time.time())
+                })))
+                logger.info(f"[comfy-deploy] Sent task_queued event for task {prompt_id} (in waiting queue)")
+            else:
+                logger.info(f"[comfy-deploy] Task {prompt_id} is queued without callback URL")
             task_manager.queued_event_sent.add(prompt_id)
-            logger.info(f"[comfy-deploy] Sent task_queued event for task {prompt_id} (in waiting queue)")
         else:
             if is_in_waiting_queue:
                 logger.info(f"[comfy-deploy] Skip duplicate task_queued event for task {prompt_id}")
@@ -950,6 +957,8 @@ async def api_execute_prompt(request):
         return web.json_response({"prompt_id": prompt_id, "client_id": client_id, "status": "submitted"})
 
     except Exception as e:
+        if "callback_url" in locals() and callback_url and "submitted_prompt_id" in locals() and not submitted_prompt_id:
+            task_manager.callback_urls.pop(prompt_id, None)
         logger.error(f"[comfy-deploy] Submit task failed: {str(e)}")
         import traceback
         logger.error(f"Error details: {traceback.format_exc()}")
@@ -1305,6 +1314,9 @@ async def process_ws_event_queue():
                 else:
                     # Process WebSocket notification (for comfy-deploy-admin web UI)
                     await send_task_update(prompt_id, event_type, data)
+                    if event_type in ["execution_success", "execution_error"]:
+                        client_id = data.get("client_id") if isinstance(data, dict) else None
+                        task_manager.cleanup_task(prompt_id, client_id)
 
             # Check queue every 100ms
             await asyncio.sleep(0.1)
@@ -1345,9 +1357,6 @@ async def send_callback(prompt_id, event_name, data):
 
     except Exception as e:
         logger.error(f"[comfy-deploy] Error sending {event_name} event: {str(e)}")
-
-    if event_name in ["task_success", "task_failed"]:
-        task_manager.cleanup_task(prompt_id, data.get('client_id'))
 
 
 # ========================= Utility functions =========================
