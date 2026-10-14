@@ -48,7 +48,7 @@ class ComfyDeployExternalImage:
         input_image = param_name
 
         return_image = None
-        if input_image and input_image.startswith('http'):
+        if isinstance(input_image, str) and input_image.lower().startswith(('http://', 'https://')):
             print(f"comfy-deploy: Fetching image from url: {input_image}")
 
             retry_count = 3
@@ -72,8 +72,10 @@ class ComfyDeployExternalImage:
                 except Exception as e:
                     print(f'Warning({have_retry}): comfy-deploy download image URL failed. Image URL: {input_image}. Error: {e}')
 
-        elif input_image and input_image.startswith('data:image/png;base64,') or input_image.startswith(
-                'data:image/jpeg;base64,') or input_image.startswith('data:image/jpg;base64,'):
+        elif input_image and (
+                input_image.startswith('data:image/png;base64,')
+                or input_image.startswith('data:image/jpeg;base64,')
+                or input_image.startswith('data:image/jpg;base64,')):
 
             print("Decoding base64 image")
             base64_image = input_image[input_image.find(",") + 1:]

@@ -63,13 +63,19 @@ class ComfyDeployExternalImageBatch:
             else:
                 json_data = [x.strip() for x in input_images.split(",")]
         else:
-            json_data = input_images
+            json_data = input_images or []
+
+        if isinstance(json_data, str):
+            json_data = [json_data]
 
         print(f"comfy-deploy: Fetching image from url: {input_images}")
         for image_url in json_data:
+            if not isinstance(image_url, str):
+                continue
+            image_url = image_url.strip()
             retry_count = 3
             have_retry = 0
-            if image_url.strip() == "" or not image_url.strip().startswith("http"):
+            if not image_url or not image_url.lower().startswith(("http://", "https://")):
                 continue
             for i in range(retry_count):
                 have_retry += 1

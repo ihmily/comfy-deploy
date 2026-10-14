@@ -1,18 +1,13 @@
-import re
 from urllib.parse import urlparse
 
 
 def is_valid_url(url):
     try:
-        result = urlparse(url)
-        if not all([result.scheme, result.netloc]):
+        if not isinstance(url, str) or not url.strip():
             return False
-        url_pattern = re.compile(
-            r"^(https?://)"
-            r"([a-zA-Z0-9-]+\.)+[a-zA-Z0-9]{1,6}"
-            r"(:\d+)?"
-            r"(/\S*)?$"
-        )
-        return bool(url_pattern.match(url))
-    except ValueError:
+
+        result = urlparse(url.strip())
+        # urlparse.hostname handles DNS names, IPv4, IPv6 and localhost.
+        return result.scheme.lower() in {"http", "https"} and bool(result.hostname)
+    except (TypeError, ValueError):
         return False

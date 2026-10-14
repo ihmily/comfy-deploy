@@ -14,9 +14,14 @@ from aiohttp import web
 from queue import Queue
 import time
 import httpx
-import random
+import secrets
 from typing import Any, Tuple, Optional
 from collections import defaultdict
+
+try:
+    import comfy_execution.jobs as comfy_jobs
+except ImportError:
+    comfy_jobs = None
 
 
 # ========================= Configuration and Initialization =========================
@@ -26,6 +31,8 @@ class Config:
     ENABLE_VERBOSE_LOGGING = False
     # Progress update minimum interval time(seconds)
     PROGRESS_THROTTLE_INTERVAL = 0.5
+    CALLBACK_RETRIES = 3
+    CALLBACK_TIMEOUT = 5.0
 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -72,7 +79,13 @@ class TaskManager:
 
         return False
 
-    def cleanup_task(self, prompt_id: str, client_id: str) -> None:
+    def cleanup_task(self, prompt_id: str, client_id: Optional[str]) -> None:
+        # Completion events from ComfyUI commonly contain only prompt_id.
+        # Recover the client mapping before removing the task state.
+        mapped_client_id = self.prompts_client.get(prompt_id)
+        if client_id is None:
+            client_id = mapped_client_id
+
         self.workflow_nodes.pop(prompt_id, None)
         self.workflow_progress.pop(prompt_id, None)
 
@@ -89,8 +102,11 @@ class TaskManager:
             self.queued_event_sent.remove(prompt_id)
 
         self.prompts_client.pop(prompt_id, None)
-        if client_id:
-            self.client_prompts.pop(client_id, None)
+        # Remove either event-provided or stored client mappings, but never a
+        # newer task that reused the same client_id.
+        for candidate_client_id in {client_id, mapped_client_id}:
+            if candidate_client_id and self.client_prompts.get(candidate_client_id) == prompt_id:
+                self.client_prompts.pop(candidate_client_id, None)
         logger.info(f"[Event handling] Task completed, clean up client_id mapping: {client_id} -> {prompt_id}")
 
 
@@ -106,6 +122,37 @@ class WebSocketManager:
 config = Config()
 task_manager = TaskManager()
 ws_manager = WebSocketManager()
+
+
+def _install_jobs_compatibility() -> None:
+    """Keep ComfyUI's jobs API schema valid for pre-create_time history entries.
+
+    ComfyUI 0.3.67+ removes missing values from the ``/api/jobs`` response,
+    while its current frontend requires ``create_time`` to always be numeric.
+    Tasks submitted by this extension now include the field; this fallback
+    keeps older history records parseable until they are cleared naturally.
+    """
+    if comfy_jobs is None:
+        return
+
+    original_extract = getattr(comfy_jobs, "_extract_job_metadata", None)
+    if original_extract is None or getattr(original_extract, "_comfy_deploy_compat", False):
+        return
+
+    def extract_job_metadata(extra_data):
+        create_time, workflow_id = original_extract(extra_data or {})
+        if create_time is None:
+            # Historical records created before ComfyUI added create_time have
+            # no reliable creation timestamp. Zero preserves numeric schema
+            # compatibility and sorts those records before timestamped jobs.
+            create_time = 0
+        return create_time, workflow_id
+
+    extract_job_metadata._comfy_deploy_compat = True
+    comfy_jobs._extract_job_metadata = extract_job_metadata
+
+
+_install_jobs_compatibility()
 
 
 def check_event_handling() -> bool:
@@ -279,7 +326,7 @@ def _update_workflow_progress(event_name: str, prompt_id: str, client_id: str, d
     if event_name == "execution_start":
         try:
             prompt_server = server.PromptServer.instance
-            queued_prompts = prompt_server.prompt_queue.get_current_queue()
+            queued_prompts = prompt_server.prompt_queue.get_current_queue_volatile()
 
             workflow_prompt = None
             for queue_item in queued_prompts[0] + queued_prompts[1]:  # current executing + waiting queue
@@ -331,7 +378,7 @@ def _update_workflow_progress(event_name: str, prompt_id: str, client_id: str, d
     elif event_name == "execution_cached":
         try:
             prompt_server = server.PromptServer.instance
-            queued_prompts = prompt_server.prompt_queue.get_current_queue()
+            queued_prompts = prompt_server.prompt_queue.get_current_queue_volatile()
 
             workflow_prompt = None
             for queue_item in queued_prompts[0] + queued_prompts[1]:  # current executing + waiting queue
@@ -709,7 +756,7 @@ def is_task_in_waiting_queue(prompt_id: str) -> bool:
     """
     try:
         prompt_server = server.PromptServer.instance
-        queue_info = prompt_server.prompt_queue.get_current_queue()
+        queue_info = prompt_server.prompt_queue.get_current_queue_volatile()
         current_tasks = queue_info[0]  # Currently executing tasks
         queued_tasks = queue_info[1]  # Waiting tasks
 
@@ -720,11 +767,22 @@ def is_task_in_waiting_queue(prompt_id: str) -> bool:
         return True
 
 
+_issued_random_seeds = set()
+
+
 def random_seed(length=15):
     length = min(15, max(1, int(length)))
     min_value = 0 if length == 1 else 10 ** (length - 1)
     max_value = 10 ** length - 1
-    return random.randint(min_value, max_value)
+
+    # Use the OS-backed generator instead of Python's process-global random
+    # state. Some model/custom nodes reset that state while executing, which
+    # can otherwise make separate API requests receive the same seed.
+    while True:
+        value = secrets.randbelow(max_value - min_value + 1) + min_value
+        if value not in _issued_random_seeds:
+            _issued_random_seeds.add(value)
+            return value
 
 
 def apply_random_seed_to_workflow(workflow_api):
@@ -735,15 +793,35 @@ def apply_random_seed_to_workflow(workflow_api):
         if not inputs:
             continue
 
-        if "seed" in inputs and not isinstance(inputs["seed"], list):
-            inputs["seed"] = random_seed(length=len(str(inputs["seed"])))
+        class_type = node_data.get("class_type")
+
+        if "seed" in inputs:
+            original_seed = inputs["seed"]
+            if isinstance(original_seed, list):
+                logger.warning(
+                    "[comfy-deploy] seed found but skipped (linked input): "
+                    "node=%s class_type=%s seed=%r",
+                    node_id,
+                    class_type,
+                    original_seed,
+                )
+            else:
+                inputs["seed"] = random_seed(length=len(str(original_seed)))
+                logger.info(
+                    "[comfy-deploy] Applied random seed: node=%s class_type=%s new=%r",
+                    node_id,
+                    class_type,
+                    inputs["seed"],
+                )
 
         if "noise_seed" in inputs and not isinstance(inputs["noise_seed"], list):
-            class_type = node_data.get("class_type")
             if class_type in NOISE_SEED_NODE_TYPES:
                 inputs["noise_seed"] = random_seed(length=len(str(inputs["noise_seed"])))
-                logger.info(
-                    f"{node_id} Applied random noise_seed {inputs['noise_seed']} to {class_type}"
+                logger.debug(
+                    "[comfy-deploy] Applied random noise_seed: node=%s class_type=%s new=%r",
+                    node_id,
+                    class_type,
+                    inputs["noise_seed"],
                 )
 
 
@@ -783,7 +861,11 @@ async def execute_prompt(prompt: dict, client_id: str = None, pre_prompt_id: str
 
     extra_data = {
         "client_id": client_id,
-        "prompt_id": prompt_id
+        "prompt_id": prompt_id,
+        # ComfyUI's current /api/jobs contract requires this field for every
+        # queued/history job. The built-in /prompt route adds it automatically,
+        # but this extension submits directly to PromptQueue.
+        "create_time": int(time.time() * 1000)
     }
     # ComfyUI v0.3.67 and above add sensitive data field
     sensitive_data = {}
@@ -825,7 +907,7 @@ def get_task_details(prompt_id: str) -> dict:
     history = prompt_server.prompt_queue.get_history(prompt_id)
 
     if not history or prompt_id not in history:
-        queue_info = prompt_server.prompt_queue.get_current_queue()
+        queue_info = prompt_server.prompt_queue.get_current_queue_volatile()
         current_tasks = queue_info[0]
         queued_tasks = queue_info[1]
 
@@ -1335,28 +1417,51 @@ async def send_callback(prompt_id, event_name, data):
 
     callback_url = task_manager.callback_urls[prompt_id]
 
+    callback_data = {
+        "event": event_name,
+        "data": data,
+        "timestamp": int(time.time())
+    }
+
     try:
-        callback_data = {
-            "event": event_name,
-            "data": data,
-            "timestamp": int(time.time())
-        }
+        timeout = httpx.Timeout(config.CALLBACK_TIMEOUT, connect=min(3.0, config.CALLBACK_TIMEOUT))
 
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                callback_url,
-                json=callback_data,
-                timeout=5.0
-            )
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            for attempt in range(1, config.CALLBACK_RETRIES + 1):
+                try:
+                    response = await client.post(callback_url, json=callback_data)
+                    if 200 <= response.status_code < 300:
+                        if check_verbose_logging():
+                            logger.info(
+                                f"[comfy-deploy] Callback sent: {event_name} -> {callback_url} "
+                                f"(HTTP {response.status_code}, attempt {attempt})"
+                            )
+                        return
 
-            if response.status_code != 200:
-                logger.warning(
-                    f"[comfy-deploy] Send failed: {event_name} -> {callback_url}, "
-                    f"Status code: {response.status_code}, Response: {response.text[:100]}"
-                )
+                    logger.warning(
+                        f"[comfy-deploy] Callback rejected: {event_name} -> {callback_url}, "
+                        f"HTTP {response.status_code}, response: {response.text[:300]!r} "
+                        f"(attempt {attempt}/{config.CALLBACK_RETRIES})"
+                    )
+                except httpx.HTTPError as exc:
+                    logger.warning(
+                        f"[comfy-deploy] Callback request error: {event_name} -> {callback_url}, "
+                        f"{type(exc).__name__}: {exc!r} "
+                        f"(attempt {attempt}/{config.CALLBACK_RETRIES})"
+                    )
 
-    except Exception as e:
-        logger.error(f"[comfy-deploy] Error sending {event_name} event: {str(e)}")
+                if attempt < config.CALLBACK_RETRIES:
+                    await asyncio.sleep(0.25 * (2 ** (attempt - 1)))
+
+        logger.error(
+            f"[comfy-deploy] Callback delivery failed after {config.CALLBACK_RETRIES} attempts: "
+            f"{event_name} -> {callback_url}"
+        )
+    except Exception as exc:
+        logger.error(
+            f"[comfy-deploy] Error sending {event_name} event to {callback_url}: "
+            f"{type(exc).__name__}: {exc!r}"
+        )
 
 
 # ========================= Utility functions =========================

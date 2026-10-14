@@ -15,7 +15,8 @@ ComfyDeploy is a ComfyUI extension that allows you to deploy ComfyUI workflows a
 ## Version Compatibility
 
 - comfy-deploy v1.0.0: supports only ComfyUI v0.3.48–0.3.66
-- comfy-deploy v1.0.1~: supports only ComfyUI v0.3.67 and above
+- comfy-deploy v1.0.1: supports ComfyUI v0.3.67–0.3.68
+- comfy-deploy v1.0.2~: supports ComfyUI v0.3.69 and above
 
 ## Installation
 
