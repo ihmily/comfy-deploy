@@ -9,6 +9,13 @@ const DEFAULT_CONFIG = {
 // Global config object
 let deployConfig = {...DEFAULT_CONFIG};
 
+function getAdminApiUrl(path) {
+    const url = new URL(deployConfig.endpoint, window.location.href);
+    const basePath = url.pathname.replace(/\/+$/, '');
+    const apiPath = basePath.endsWith('/api') ? basePath : `${basePath}/api`;
+    return new URL(`${url.origin}${apiPath}${path}`).href;
+}
+
 function loadConfig() {
     try {
         const savedEndpoint = localStorage.getItem('comfy_api_deploy_endpoint');
@@ -334,7 +341,7 @@ function updateDeployStatus() {
     }
     
     // Test connection
-    fetch(deployConfig.endpoint + '/workflows/status', { 
+    fetch(getAdminApiUrl('/workflows/status'), {
         method: 'GET',
         headers: {
             'Content-Type': 'application/json',
@@ -690,11 +697,11 @@ async function deployWorkflow() {
         let url, method;
         if (workflowId) {
             // update workflow
-            url = `${deployConfig.endpoint}/workflows/${workflowId}`;
+            url = getAdminApiUrl(`/workflows/${workflowId}`);
             method = 'PUT';
         } else {
             // new workflow
-            url = `${deployConfig.endpoint}/workflows`;
+            url = getAdminApiUrl('/workflows');
             method = 'POST';
             requestData.workflow_name = workflowName;
         }
